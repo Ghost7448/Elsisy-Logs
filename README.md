@@ -1,4 +1,4 @@
-# NMR LOGS
+# Elsisy LOGS
 
 ## 1) Install
 ```bash
