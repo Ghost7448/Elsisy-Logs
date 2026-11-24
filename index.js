@@ -61,6 +61,8 @@ const auditEntryCache = new Map();
 const voiceAuditCache = new Map();
 const voiceAuditQueue = new Map();
 const consumedAuditEntries = new Map();
+// Track how many distinct members have been matched to each grouped voice audit entry.
+const voiceAuditAssignments = new Map();
 
 // ============================================
 // BULK VOICE DISCONNECT CACHE
@@ -758,12 +760,8 @@ async function gracefulExit(signal, exitCode = 0) {
   process.exit(exitCode);
 }
 
-// Voice audit entries can have no direct targetId for MOVE/DISCONNECT.
-// Search recent entries by action + channel/count and fall back to the newest fresh entry.
-// ============================================
-// VOICE AUDIT RESOLVERS
-// ============================================
-
+// Voice MOVE / DISCONNECT resolver.
+// Discord may group several member actions into one audit-log entry with extra.count.
 function voiceAuditCacheKey(guildId, action, memberId) {
   return `${guildId}:${action}:${memberId}`;
 }
@@ -776,19 +774,14 @@ function isFreshAudit(entry, maxAge = 30000) {
 
 function markAuditConsumed(guild, entry, ttl = 10000) {
   if (!guild || !entry) return;
-  consumedAuditEntries.set(
-    `${guild.id}:${entry.id}`,
-    Date.now() + ttl
-  );
+  consumedAuditEntries.set(`${guild.id}:${entry.id}`, Date.now() + ttl);
   auditEntryCache.set(`${guild.id}:${entry.id}`, entry);
   setTimeout(() => {
     auditEntryCache.delete(`${guild.id}:${entry.id}`);
     consumedAuditEntries.delete(`${guild.id}:${entry.id}`);
-  }, 15000);
+  }, Math.max(ttl, 15000));
 }
 
-// Voice MOVE / DISCONNECT resolver.
-// Discord may omit target_id for these audit entries and instead provide channel_id/count.
 function voiceAuditActionKey(guildId, action) {
   return `${guildId}:${action}`;
 }
@@ -801,19 +794,25 @@ function getAuditChannelId(entry) {
 function getAuditCount(entry) {
   const raw = entry?.extra?.count;
   if (raw === undefined || raw === null) return 1;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : 1;
+  const count = Number(raw);
+  return Number.isInteger(count) && count > 0 ? count : 1;
 }
 
 function queueVoiceAuditEntry(guild, entry) {
   if (!guild || !entry?.executorId) return;
   if (![AuditLogEvent.MemberMove, AuditLogEvent.MemberDisconnect].includes(entry.action)) return;
+
   const key = voiceAuditActionKey(guild.id, entry.action);
-  const list = (voiceAuditQueue.get(key) || []).filter(e => isFreshAudit(e, 15000));
+  const list = (voiceAuditQueue.get(key) || []).filter(
+    item => item.id !== entry.id && isFreshAudit(item, 15000)
+  );
   list.unshift(entry);
-  voiceAuditQueue.set(key, list.slice(0, 20));
+  voiceAuditQueue.set(key, list.slice(0, 30));
+
   setTimeout(() => {
-    const current = (voiceAuditQueue.get(key) || []).filter(e => e.id !== entry.id && isFreshAudit(e, 15000));
+    const current = (voiceAuditQueue.get(key) || []).filter(
+      item => item.id !== entry.id && isFreshAudit(item, 15000)
+    );
     if (current.length) voiceAuditQueue.set(key, current);
     else voiceAuditQueue.delete(key);
   }, 16000);
@@ -821,189 +820,103 @@ function queueVoiceAuditEntry(guild, entry) {
 
 function getQueuedVoiceAudits(guild, action) {
   const key = voiceAuditActionKey(guild.id, action);
-  const list = (voiceAuditQueue.get(key) || []).filter(e => isFreshAudit(e, 15000));
+  const list = (voiceAuditQueue.get(key) || []).filter(item => isFreshAudit(item, 15000));
   if (list.length) voiceAuditQueue.set(key, list);
   else voiceAuditQueue.delete(key);
   return list;
 }
 
+// A grouped entry can explain up to extra.count distinct members.
+// The same member can reuse its own match if Discord emits a duplicate state update.
+function claimVoiceAuditEntry(guild, entry, memberId) {
+  if (!guild || !entry || !memberId) return false;
+
+  const key = `${guild.id}:${entry.id}`;
+  let assignments = voiceAuditAssignments.get(key);
+  if (!assignments) {
+    assignments = new Set();
+    voiceAuditAssignments.set(key, assignments);
+  }
+
+  const id = String(memberId);
+  if (assignments.has(id)) return true;
+
+  if (assignments.size >= getAuditCount(entry)) return false;
+
+  assignments.add(id);
+  setTimeout(() => {
+    const current = voiceAuditAssignments.get(key);
+    if (current === assignments) voiceAuditAssignments.delete(key);
+  }, 30000);
+
+  return true;
+}
+
 async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 15000) {
-  if (!guild || !memberId) return null;
+  if (!guild || !memberId || !channelId) return null;
 
   const types = Array.isArray(type) ? type : [type];
+  const wantedMemberId = String(memberId);
+  const wantedChannelId = String(channelId);
 
   const matches = entry => {
-    if (!entry?.executorId) return false;
-    if (!isFreshAudit(entry, maxAge)) return false;
+    if (!entry?.executorId || !isFreshAudit(entry, maxAge)) return false;
 
-    // The executor cannot be the member who left by himself.
-    if (entry.executorId === memberId) return false;
+    // A member cannot be treated as the administrator who moved/disconnected themself.
+    if (String(entry.executorId) === wantedMemberId) return false;
 
-    const auditChannel = getAuditChannelId(entry);
     const targetId = entry.targetId ? String(entry.targetId) : null;
-    const wantedMemberId = String(memberId);
+    const auditChannelId = getAuditChannelId(entry);
 
-    const count = getAuditCount(entry);
+    // Exact target is the strongest match. If target_id is absent, require
+    // the exact affected voice channel and an available count slot.
+    if (targetId && targetId !== wantedMemberId) return false;
+    if (!targetId && (!auditChannelId || String(auditChannelId) !== wantedChannelId)) return false;
 
-    // --------------------------------------------------
-    // MEMBER DISCONNECT
-    // Discord can put multiple disconnects into ONE
-    // audit-log entry.
-    // --------------------------------------------------
-    if (entry.action === AuditLogEvent.MemberDisconnect) {
+    if (auditChannelId && String(auditChannelId) !== wantedChannelId) return false;
 
-      // If this is a grouped disconnect, DO NOT require
-      // target_id to match the current member.
-      if (count > 1) {
-        if (
-          channelId &&
-          auditChannel &&
-          String(auditChannel) !== String(channelId)
-        ) {
-          return false;
-        }
-
-        return true;
-      }
-
-      // Normal single disconnect.
-      if (targetId) {
-        return targetId === wantedMemberId;
-      }
-
-      if (
-        channelId &&
-        auditChannel &&
-        String(auditChannel) !== String(channelId)
-      ) {
-        return false;
-      }
-
-      return true;
-    }
-
-    // --------------------------------------------------
-    // OTHER VOICE ACTIONS
-    // --------------------------------------------------
-
-    if (channelId && auditChannel) {
-      if (String(auditChannel) !== String(channelId)) {
-        return false;
-      }
-    }
-
-    // For MOVE, target_id should normally identify the member.
-    if (targetId) {
-      return targetId === wantedMemberId;
-    }
-
-    // If Discord omitted target_id, only accept a
-    // single-member audit entry.
-    if (count !== 1) return false;
-
-    return true;
+    const assignments = voiceAuditAssignments.get(`${guild.id}:${entry.id}`);
+    if (assignments?.has(wantedMemberId)) return true;
+    return (assignments?.size || 0) < getAuditCount(entry);
   };
 
-  // --------------------------------------------------
-  // CACHE
-  // --------------------------------------------------
-
+  // First use the exact per-member cache when Discord supplies target_id.
   for (const action of types) {
-    const cached =
-      voiceAuditCache.get(
-        voiceAuditCacheKey(guild.id, action, memberId)
-      );
+    const cached = voiceAuditCache.get(voiceAuditCacheKey(guild.id, action, memberId));
+    if (matches(cached) && claimVoiceAuditEntry(guild, cached, memberId)) return cached;
+  }
 
-    if (matches(cached)) {
+  // Then try grouped entries received through GuildAuditLogEntryCreate.
+  for (const action of types) {
+    const candidates = getQueuedVoiceAudits(guild, action)
+      .filter(matches)
+      .sort((a, b) => b.createdTimestamp - a.createdTimestamp);
 
-      // IMPORTANT:
-      // Never consume grouped disconnect entries.
-      if (
-        entryIsSingleAudit(cached)
-      ) {
-        markAuditConsumed(guild, cached, 10000);
-      }
-
-      return cached;
+    for (const entry of candidates) {
+      if (claimVoiceAuditEntry(guild, entry, memberId)) return entry;
     }
   }
 
-  // --------------------------------------------------
-  // QUEUE
-  // --------------------------------------------------
-
-  for (const action of types) {
-    const candidates =
-      getQueuedVoiceAudits(guild, action)
-        .filter(matches)
-        .sort(
-          (a, b) =>
-            b.createdTimestamp - a.createdTimestamp
-        );
-
-    if (candidates.length) {
-      const entry = candidates[0];
-
-      // Grouped disconnects must remain available
-      // for the other members in the same batch.
-      if (getAuditCount(entry) <= 1) {
-        markAuditConsumed(guild, entry, 10000);
-      }
-
-      return entry;
-    }
-  }
-
-  // --------------------------------------------------
-  // FETCH DISCORD AUDIT LOG
-  // --------------------------------------------------
-
-  for (let attempt = 0; attempt < 20; attempt++) {
-
-    if (attempt) {
-      await wait(350);
-    }
+  // Finally fetch fresh Audit Logs; retry briefly because Discord can publish
+  // the voice state event before its corresponding audit entry.
+  for (let attempt = 0; attempt < 12; attempt++) {
+    if (attempt) await wait(350);
 
     for (const action of types) {
       try {
-        const logs =
-          await guild.fetchAuditLogs({
-            type: action,
-            limit: 50
-          });
+        const logs = await guild.fetchAuditLogs({ type: action, limit: 50 });
+        const candidates = [...logs.entries.values()]
+          .filter(matches)
+          .sort((a, b) => b.createdTimestamp - a.createdTimestamp);
 
-        const candidates =
-          [...logs.entries.values()]
-            .filter(matches)
-            .sort(
-              (a, b) =>
-                b.createdTimestamp -
-                a.createdTimestamp
-            );
-
-        if (!candidates.length) {
-          continue;
+        for (const entry of candidates) {
+          if (!claimVoiceAuditEntry(guild, entry, memberId)) continue;
+          queueVoiceAuditEntry(guild, entry);
+          return entry;
         }
-
-        const entry = candidates[0];
-
-        // DO NOT consume grouped disconnect entries.
-        if (getAuditCount(entry) <= 1) {
-          markAuditConsumed(
-            guild,
-            entry,
-            10000
-          );
-        }
-
-        queueVoiceAuditEntry(
-          guild,
-          entry
-        );
-
-        return entry;
-
-      } catch {}
+      } catch {
+        // Keep voice logging alive if Discord temporarily rejects an audit request.
+      }
     }
   }
 
@@ -1834,126 +1747,59 @@ client.on(
     }
 
 // ------------------------------
-// DISCONNECT / LEAVE - INSTANT
+// DISCONNECT / LEAVE
 // ------------------------------
 if (disconnected) {
-
-  // لو فيه Audit Cache جاهز، نعرف فورًا إنه Disconnect إداري
-  let audit = getVoiceDisconnectBatch(
+  const audit = await findVoiceAudit(
     guild,
-    oldState.channelId
+    AuditLogEvent.MemberDisconnect,
+    user.id,
+    oldState.channelId,
+    15000
   );
 
-  // لو مفيش Cache، ابحث بسرعة جدًا فقط
-  // بدل ما نستنى findVoiceAudit بكل محاولاته
-  if (!audit) {
-    try {
-      const logs = await guild.fetchAuditLogs({
-        type: AuditLogEvent.MemberDisconnect,
-        limit: 10
-      });
-
-      const now = Date.now();
-
-      audit = [...logs.entries.values()]
-        .filter(entry => {
-          if (!entry?.executorId) return false;
-
-          const age =
-            now - entry.createdTimestamp;
-
-          if (age < -1000 || age > 1500) {
-            return false;
-          }
-
-          if (
-            entry.targetId &&
-            entry.targetId !== user.id
-          ) {
-            return false;
-          }
-
-          return true;
-        })
-        .sort(
-          (a, b) =>
-            b.createdTimestamp -
-            a.createdTimestamp
-        )[0] || null;
-
-    } catch {}
-  }
-
-  // ==========================================
-  // ADMIN DISCONNECT
-  // ==========================================
   if (audit?.executorId) {
-
-    setVoiceDisconnectBatch(
-      guild,
-      oldState.channelId,
-      audit
-    );
+    const executor = audit.executor || await client.users.fetch(audit.executorId).catch(() => null);
 
     await sendLog('voice', {
       title: '📤 VOICE DISCONNECT',
-
-      description:
-        '**تم فصل العضو من الروم الصوتي بواسطة الإدارة**',
-
+      description: '**تم فصل العضو من الروم الصوتي بواسطة الإدارة**',
       color: COLORS.danger,
-
-      thumbnail:
-        user.displayAvatarURL(),
-
+      thumbnail: user.displayAvatarURL(),
       fields: [
         ...base,
-
         {
           name: '📍 الروم السابق',
           value: channelText(oldState)
         },
-
         {
           name: '🛡️ بواسطة',
-          value: userInfo(audit.executor)
+          value: executor ? userInfo(executor) : `<@${audit.executorId}>`
+        },
+        {
+          name: '🔢 عدد الـ Actions',
+          value: String(getAuditCount(audit))
         }
       ]
     });
-
-  }
-
-  // ==========================================
-  // NORMAL LEAVE
-  // ==========================================
-  else {
-
+  } else {
     await sendLog('voice', {
       title: '📤 VOICE LEAVE',
-
-      description:
-        '**العضو خرج من الروم الصوتي**',
-
+      description: '**العضو خرج من الروم الصوتي**',
       color: COLORS.warning,
-
-      thumbnail:
-        user.displayAvatarURL(),
-
+      thumbnail: user.displayAvatarURL(),
       fields: [
         ...base,
-
         {
           name: '📍 الروم السابق',
           value: channelText(oldState)
         },
-
         {
           name: '🛡️ بواسطة',
           value: userInfo(user)
         }
       ]
     });
-
   }
 }
 
@@ -4358,8 +4204,8 @@ client.on(
         AuditLogEvent.MemberDisconnect,
         AuditLogEvent.MemberUpdate
       ].filter(Boolean).includes(entry.action) &&
-      entry.targetId &&
-      entry.executorId
+      entry.executorId &&
+      (entry.targetId || [AuditLogEvent.MemberMove, AuditLogEvent.MemberDisconnect].includes(entry.action))
     ) {
       voiceAuditCache.set(
         voiceAuditCacheKey(guild.id, entry.action, entry.targetId),
