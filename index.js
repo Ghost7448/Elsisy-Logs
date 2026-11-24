@@ -788,7 +788,14 @@ function voiceAuditActionKey(guildId, action) {
 
 function getAuditChannelId(entry) {
   const extra = entry?.extra || {};
-  return extra.channelId || extra.channel_id || extra.channel?.id || null;
+  const channel = extra.channel;
+  return (
+    extra.channelId ||
+    extra.channel_id ||
+    (typeof channel === 'string' ? channel : channel?.id) ||
+    extra.channel?.channelId ||
+    null
+  );
 }
 
 function getAuditCount(entry) {
@@ -899,8 +906,9 @@ async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 15000) 
 
   // Finally fetch fresh Audit Logs; retry briefly because Discord can publish
   // the voice state event before its corresponding audit entry.
-  for (let attempt = 0; attempt < 12; attempt++) {
-    if (attempt) await wait(350);
+  // Audit-log propagation can lag behind the voice-state event.
+  for (let attempt = 0; attempt < 24; attempt++) {
+    if (attempt) await wait(500);
 
     for (const action of types) {
       try {
