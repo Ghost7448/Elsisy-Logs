@@ -1841,7 +1841,11 @@ if (disconnected) {
             value: executor
               ? userInfo(executor)
               : userInfo(user)
-          }
+          },
+          ...(audit ? [{
+            name: '🔢 عدد الـ Actions',
+            value: String(getAuditCount(audit))
+          }] : [])
         ]
       });
     }
@@ -4204,8 +4208,8 @@ client.on(
         AuditLogEvent.MemberDisconnect,
         AuditLogEvent.MemberUpdate
       ].filter(Boolean).includes(entry.action) &&
-      entry.executorId &&
-      (entry.targetId || [AuditLogEvent.MemberMove, AuditLogEvent.MemberDisconnect].includes(entry.action))
+      entry.targetId &&
+      entry.executorId
     ) {
       voiceAuditCache.set(
         voiceAuditCacheKey(guild.id, entry.action, entry.targetId),
